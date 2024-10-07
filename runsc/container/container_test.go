@@ -3654,3 +3654,133 @@ func TestLookupEROFS(t *testing.T) {
 		}
 	}
 }
+
+func getSpecsForValidation(t *testing.T, test string) (*specs.Spec, *specs.Spec) {
+	spec, _ := sleepSpecConf(t)
+	restoreSpec, _ := sleepSpecConf(t)
+
+	switch test {
+	case "Terminal":
+		restoreSpec.Process.Terminal = true
+	case "Mounts":
+		dir, err := os.MkdirTemp(testutil.TmpDir(), "restore-test")
+		if err != nil {
+			t.Fatalf("os.MkdirTemp() failed: %v", err)
+		}
+		if err := os.Chmod(dir, 0777); err != nil {
+			t.Fatalf("error chmoding file: %q, %v", dir, err)
+		}
+		mountDest := filepath.Join(dir, "/foo-dir")
+		restoreSpec.Mounts = append(restoreSpec.Mounts, specs.Mount{
+			Destination: mountDest,
+			Type:        "tmpfs",
+		})
+	case "Args":
+		restoreSpec.Process.Args = append(restoreSpec.Process.Args, "new arg")
+	case "Devices":
+		spec.Linux = &specs.Linux{}
+		restoreSpec.Linux = &specs.Linux{}
+		mode := os.FileMode(0666)
+		dev := specs.LinuxDevice{
+			Path:     "/dev/nvidiactl",
+			Type:     "c",
+			Major:    195, // nvgpu.NV_MAJOR_DEVICE_NUMBER,
+			Minor:    255, // nvgpu.NV_CONTROL_DEVICE_MINOR,
+			FileMode: &mode,
+		}
+		restoreSpec.Linux.Devices = append(restoreSpec.Linux.Devices, dev)
+	case "Namespace":
+		spec.Linux = &specs.Linux{}
+		restoreSpec.Linux = &specs.Linux{}
+		restoreSpec.Linux.Namespaces = append(restoreSpec.Linux.Namespaces, specs.LinuxNamespace{
+			Type: "network",
+			Path: fmt.Sprintf("/proc/%d/ns/net", os.Getpid()),
+		})
+	case "Seccomp":
+		spec.Linux = &specs.Linux{}
+		restoreSpec.Linux = &specs.Linux{}
+		restoreSpec.Linux.Seccomp = &specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+		}
+	}
+	return spec, restoreSpec
+}
+
+func TestSpecValidationShouldFail(t *testing.T) {
+	// TODO(b/359591006): Add more tests.
+	tests := map[string]string{
+		"Terminal":  "Terminal does not match across checkpoint restore",
+		"Mounts":    "Mount does not match across checkpoint restore",
+		"Args":      "Args does not match across checkpoint restore",
+		"Devices":   "Device does not match across checkpoint restore",
+		"Namespace": "Namespace does not match across checkpoint restore",
+		"Seccomp":   "Seccomp does not match across checkpoint restore",
+	}
+	for test, want := range tests {
+		spec, restoreSpec := getSpecsForValidation(t, test)
+
+		conf := testutil.TestConfig(t)
+		_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+		if err != nil {
+			t.Fatalf("error setting up container: %v", err)
+		}
+		defer cleanup()
+
+		dir, err := ioutil.TempDir(testutil.TmpDir(), "checkpoint-test")
+		if err != nil {
+			t.Fatalf("ioutil.TempDir failed: %v", err)
+		}
+		defer os.RemoveAll(dir)
+		if err := os.Chmod(dir, 0777); err != nil {
+			t.Fatalf("error chmoding file: %q, %v", dir, err)
+		}
+		args := Args{
+			ID:        testutil.RandomContainerID(),
+			Spec:      spec,
+			BundleDir: bundleDir,
+		}
+		cont, err := New(conf, args)
+		if err != nil {
+			t.Fatalf("error creating container: %v", err)
+		}
+
+		if err := cont.Start(conf); err != nil {
+			t.Fatalf("error starting container: %v", err)
+		}
+
+		// Checkpoint running container; save state into new file.
+		if err := cont.Checkpoint(dir, false /* direct */, statefile.Options{Compression: statefile.CompressionLevelFlateBestSpeed}, pgalloc.SaveOpts{}); err != nil {
+			t.Fatalf("error checkpointing container to empty file: %v", err)
+		}
+
+		// Change the spec for the validation to fail.
+		_, bundleDir2, cleanup2, err := testutil.SetupContainer(restoreSpec, conf)
+		if err != nil {
+			t.Fatalf("error setting up container: %v", err)
+		}
+		defer cleanup2()
+
+		// Restore into a new container with different ID (e.g. clone). Keep the
+		// initial container running to ensure no conflict with it.
+		args2 := Args{
+			ID:        testutil.RandomContainerID(),
+			Spec:      restoreSpec,
+			BundleDir: bundleDir2,
+		}
+		cont2, err := New(conf, args2)
+		if err != nil {
+			t.Fatalf("error creating container: %v", err)
+		}
+		defer cont2.Destroy()
+
+		err = cont2.Restore(conf, dir, false /* direct */, false /* background */)
+		if err == nil {
+			t.Fatalf("spec validation failed for test %v", test)
+		}
+
+		got := err.Error()
+		if !strings.Contains(got, want) {
+			t.Fatalf("wrong error message, got: %v, want: %v", got, want)
+		}
+	}
+}

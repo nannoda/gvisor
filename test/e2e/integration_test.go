@@ -1212,3 +1212,67 @@ func TestCheckpointResume(t *testing.T) {
 		t.Fatalf("docker kill failed: %v", err)
 	}
 }
+
+// Test to check restore of a TCP listening connection.
+func TestCheckpointRestoreListeningConnection(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint is not supported.")
+	}
+	dockerutil.EnsureDockerExperimentalEnabled()
+
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	port := 9000
+	opts := dockerutil.RunOpts{
+		Image: "basic/integrationtest",
+		Ports: []int{port},
+	}
+
+	// Start the tcp server.
+	if err := d.Spawn(ctx, opts, "./tcp_server"); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+
+	// Ensure the tcp server is running.
+	time.Sleep(2 * time.Second)
+
+	// Create a snapshot.
+	if err := d.Checkpoint(ctx, "networktest"); err != nil {
+		t.Fatalf("docker checkpoint failed: %v", err)
+	}
+	if err := d.WaitTimeout(ctx, defaultWait); err != nil {
+		t.Fatalf("wait failed: %v", err)
+	}
+	// TODO(b/143498576): Remove Poll after github.com/moby/moby/issues/38963 is fixed.
+	if err := testutil.Poll(func() error { return d.Restore(ctx, "networktest") }, defaultWait); err != nil {
+		t.Fatalf("docker restore failed: %v", err)
+	}
+
+	newIP, newErr := d.FindIP(ctx, false)
+	if newErr != nil {
+		t.Fatalf("docker.FindIP failed: %v", newErr)
+	}
+	newserverIP := newIP.String() + ":" + strconv.Itoa(port)
+	conn, err := net.DialTimeout("tcp", newserverIP, 2*time.Minute)
+	if err != nil {
+		t.Fatalf("Error connecting to server: %v", err)
+	}
+	defer conn.Close()
+
+	readBuf := make([]byte, 32)
+	_, readErr := conn.Read(readBuf)
+	if readErr != nil {
+		fmt.Println("Error reading:", readErr)
+	}
+
+	if _, err := conn.Write([]byte("Hello!")); err != nil {
+		fmt.Println("Error writing:", err)
+		return
+	}
+
+	if err := d.Wait(ctx); err != nil {
+		t.Fatalf("Wait failed: %v", err)
+	}
+}
